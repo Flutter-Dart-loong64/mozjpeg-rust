@@ -45,9 +45,14 @@ pub struct Compress {
 
 #[derive(Copy, Clone)]
 pub enum ScanMode {
+    /// Encode all color channels in each scan pass. Produces the best visual
+    /// experience during progressive loading — the image sharpens uniformly.
     AllComponentsTogether = 0,
-    /// Can flash grayscale or green-tinted images
+    /// Encode each color channel in a separate scan pass. During progressive
+    /// loading, this can cause the image to flash grayscale or appear
+    /// green-tinted before all channels arrive.
     ScanPerComponent = 1,
+    /// Let MozJPEG decide the scan layout automatically.
     Auto = 2,
 }
 
@@ -58,7 +63,10 @@ pub struct CompressStarted<W> {
 }
 
 impl Compress {
-    /// Compress image using input in this colorspace.
+    /// Compress image using the given *input* color space.
+    /// The output JPEG color space defaults to a sensible match
+    /// (e.g., RGB→YCbCr, Grayscale→Grayscale), but can be overridden with
+    /// [`set_color_space()`](Self::set_color_space).
     ///
     /// ## Panics
     ///
@@ -189,6 +197,15 @@ impl<W> CompressStarted<W> {
 
 impl Compress {
     /// Expose components for modification, e.g. to set chroma subsampling
+    ///
+    /// All per-component fields (sampling factors, quantization table
+    /// assignments, Huffman table assignments) are reset to colorspace defaults by
+    /// [`set_scan_optimization_mode()`](Self::set_scan_optimization_mode),
+    /// [`set_fastest_defaults()`](Self::set_fastest_defaults), and
+    /// [`set_color_space()`](Self::set_color_space).
+    /// For example, 4:2:2 subsampling will silently revert to 4:2:0.
+    /// Call those methods *before* modifying components.
+    /// The same applies to [`set_chroma_sampling_pixel_sizes()`](Self::set_chroma_sampling_pixel_sizes).
     pub fn components_mut(&mut self) -> &mut [CompInfo] {
         if self.cinfo.comp_info.is_null() {
             return &mut [];
@@ -252,7 +269,8 @@ impl<W> CompressStarted<W> {
     }
 
     /// Advanced. Only possible after `set_raw_data_in()`.
-    /// Write YCbCr blocks pixels instead of usual color space
+    /// Write pre-downsampled component planes (typically YCbCr) directly,
+    /// bypassing the encoder's color conversion and downsampling.
     ///
     /// See `raw_data_in` in libjpeg docs
     ///
@@ -319,9 +337,14 @@ impl<W> CompressStarted<W> {
 }
 
 impl Compress {
-    /// Set color space of JPEG being written, different from input color space
+    /// Set the *output* color space of the JPEG being written. This can differ
+    /// from the input color space set in [`new()`](Self::new) — libjpeg handles
+    /// the conversion automatically (e.g., RGB input → YCbCr output).
     ///
-    /// See `jpeg_set_colorspace` in libjpeg docs
+    /// This resets all per-component settings to colorspace defaults:
+    /// sampling factors, quantization table assignments, and Huffman table assignments.
+    /// Set chroma subsampling via [`components_mut()`](Self::components_mut) or
+    /// [`set_chroma_sampling_pixel_sizes()`](Self::set_chroma_sampling_pixel_sizes) *after* this call.
     pub fn set_color_space(&mut self, color_space: ColorSpace) {
         unsafe {
             ffi::jpeg_set_colorspace(&mut self.cinfo, color_space);
@@ -346,13 +369,24 @@ impl Compress {
     ///
     /// [^note]: This method is not related to EXIF-based intrinsic image sizing,
     /// and does not affect rendering in browsers.
+    ///
+    /// Reset to defaults by
+    /// [`set_scan_optimization_mode()`](Self::set_scan_optimization_mode) and
+    /// [`set_fastest_defaults()`](Self::set_fastest_defaults). Call those methods first.
     pub fn set_pixel_density(&mut self, density: PixelDensity) {
         self.cinfo.density_unit = density.unit as u8;
         self.cinfo.X_density = density.x;
         self.cinfo.Y_density = density.y;
     }
 
-    /// If true, it will use MozJPEG's scan optimization. Makes progressive image files smaller.
+    /// If `true`, MozJPEG will try multiple progressive scan configurations and
+    /// pick the one that compresses best. This can noticeably reduce file size
+    /// for progressive JPEGs, at the cost of slower encoding.
+    ///
+    /// Reset by both
+    /// [`set_scan_optimization_mode()`](Self::set_scan_optimization_mode) (→ `true`) and
+    /// [`set_fastest_defaults()`](Self::set_fastest_defaults) (→ `false`).
+    /// Call those methods first.
     pub fn set_optimize_scans(&mut self, opt: bool) {
         unsafe {
             ffi::jpeg_c_set_bool_param(&mut self.cinfo, J_BOOLEAN_PARAM::JBOOLEAN_OPTIMIZE_SCANS, boolean::from(opt));
@@ -362,32 +396,90 @@ impl Compress {
         }
     }
 
-    /// If 1-100 (non-zero), it will use MozJPEG's smoothing.
+    /// Apply inter-block smoothing to reduce blocky artifacts in the output.
+    /// Values range from 0 (no smoothing, the default) to 100 (maximum).
+    /// Higher values reduce visible block boundaries but may soften fine detail.
+    ///
+    /// This value is silently reset to 0 by
+    /// [`set_scan_optimization_mode()`](Self::set_scan_optimization_mode) and
+    /// [`set_fastest_defaults()`](Self::set_fastest_defaults) due to the internal
+    /// `jpeg_set_defaults()` call. Call those methods *before* this one.
     pub fn set_smoothing_factor(&mut self, smoothing_factor: u8) {
         self.cinfo.smoothing_factor = c_int::from(smoothing_factor);
     }
 
     /// Set to `false` to make files larger for no reason
+    ///
+    /// Enable optimized Huffman coding. When `true` (the default in MozJPEG),
+    /// the encoder computes custom Huffman tables from the actual image data,
+    /// typically reducing file size by 2–10%. When `false`, it uses fixed
+    /// default tables, which produce larger files.
+    ///
+    /// Reset by both
+    /// [`set_scan_optimization_mode()`](Self::set_scan_optimization_mode) (→ `true`) and
+    /// [`set_fastest_defaults()`](Self::set_fastest_defaults) (→ `false`).
+    /// Call those methods first.
     pub fn set_optimize_coding(&mut self, opt: bool) {
         self.cinfo.optimize_coding = boolean::from(opt);
     }
 
-    /// Specifies whether multiple scans should be considered during trellis
-    /// quantization.
+    /// Specifies whether multiple scan configurations should be evaluated
+    /// during trellis quantization. Trellis quantization finds the
+    /// least-distortion way to round DCT coefficients to the quantization grid;
+    /// enabling this option lets it also consider how different scan layouts
+    /// interact with that rounding, for marginally better compression.
+    ///
+    /// Reset to `false` by both
+    /// [`set_scan_optimization_mode()`](Self::set_scan_optimization_mode) and
+    /// [`set_fastest_defaults()`](Self::set_fastest_defaults). Call those methods first.
     pub fn set_use_scans_in_trellis(&mut self, opt: bool) {
         unsafe {
             ffi::jpeg_c_set_bool_param(&mut self.cinfo, J_BOOLEAN_PARAM::JBOOLEAN_USE_SCANS_IN_TRELLIS, boolean::from(opt));
         }
     }
 
-    /// You can only turn it on
+    /// Enable progressive JPEG encoding (recommended)
+    ///
+    /// Progressive JPEGs render blurry-to-sharp
+    /// during download, instead of top-to-bottom like baseline JPEGs. They also
+    /// tend to compress slightly better. Once enabled,
+    /// progressive mode cannot be turned off without creating a new [`Compress`].
+    ///
+    /// Reset by [`set_fastest_defaults()`](Self::set_fastest_defaults).
+    /// Call that method first.
+    /// Not affected by [`set_scan_optimization_mode()`](Self::set_scan_optimization_mode).
     pub fn set_progressive_mode(&mut self) {
         unsafe {
             ffi::jpeg_simple_progression(&mut self.cinfo);
         }
     }
 
-    /// One scan for all components looks best. Other options may flash grayscale or green images.
+    /// Set how color channels are grouped into progressive scan passes.
+    /// [`AllComponentsTogether`](ScanMode::AllComponentsTogether) (recommended) encodes all
+    /// channels in each pass, giving the smoothest progressive display.
+    /// [`ScanPerComponent`](ScanMode::ScanPerComponent) separates channels, which can flash
+    /// grayscale or green during loading.
+    /// [`Auto`](ScanMode::Auto) lets MozJPEG decide.
+    ///
+    /// # Warning: resets other settings
+    ///
+    /// Internally calls `jpeg_set_defaults()`, which resets the following to their defaults:
+    ///
+    /// - [`set_raw_data_in()`](Self::set_raw_data_in) → `false`
+    /// - [`set_optimize_coding()`](Self::set_optimize_coding) → `true` (forced by mozjpeg profile)
+    /// - [`set_smoothing_factor()`](Self::set_smoothing_factor) → `0`
+    /// - [`set_pixel_density()`](Self::set_pixel_density) → lost (unit=0, 1×1)
+    /// - [`set_quality()`](Self::set_quality), [`set_luma_qtable()`](Self::set_luma_qtable),
+    ///   [`set_chroma_qtable()`](Self::set_chroma_qtable) → overwritten with quality-75 tables
+    /// - [`components_mut()`](Self::components_mut) — sampling factors, quantization table
+    ///   assignments, and Huffman table assignments all revert to colorspace defaults
+    ///   (e.g., 4:2:2 reverts to 4:2:0).
+    ///   Also affects [`set_chroma_sampling_pixel_sizes()`](Self::set_chroma_sampling_pixel_sizes).
+    /// - [`set_optimize_scans()`](Self::set_optimize_scans) → `true` (forced by mozjpeg profile)
+    /// - [`set_use_scans_in_trellis()`](Self::set_use_scans_in_trellis) → `false`
+    ///
+    /// **Call this method before** any of the above, or their values will be silently lost.
+    /// See also [`set_fastest_defaults()`](Self::set_fastest_defaults), which resets even more.
     pub fn set_scan_optimization_mode(&mut self, mode: ScanMode) {
         let smoothing_factor = self.cinfo.smoothing_factor;
         unsafe {
@@ -399,7 +491,29 @@ impl Compress {
 
     /// Reset to libjpeg v6 settings
     ///
-    /// It gives files identical with libjpeg-turbo
+    /// It gives files identical with libjpeg-turbo.
+    ///
+    /// # Warning: resets other settings
+    ///
+    /// Internally calls `jpeg_set_defaults()` with JCP_FASTEST profile.
+    /// Resets everything that
+    /// [`set_scan_optimization_mode()`](Self::set_scan_optimization_mode) resets, plus more:
+    ///
+    /// - [`set_raw_data_in()`](Self::set_raw_data_in) → `false`
+    /// - [`set_optimize_coding()`](Self::set_optimize_coding) → `false`
+    /// - [`set_smoothing_factor()`](Self::set_smoothing_factor) → `0`
+    /// - [`set_pixel_density()`](Self::set_pixel_density) → lost (unit=0, 1×1)
+    /// - [`set_quality()`](Self::set_quality), [`set_luma_qtable()`](Self::set_luma_qtable),
+    ///   [`set_chroma_qtable()`](Self::set_chroma_qtable) → overwritten with quality-75 tables
+    /// - [`components_mut()`](Self::components_mut) — sampling factors, quantization table
+    ///   assignments, and Huffman table assignments all revert to colorspace defaults
+    ///   (e.g., 4:2:2 reverts to 4:2:0).
+    ///   Also affects [`set_chroma_sampling_pixel_sizes()`](Self::set_chroma_sampling_pixel_sizes).
+    /// - [`set_progressive_mode()`](Self::set_progressive_mode) → lost (scan info cleared)
+    /// - [`set_optimize_scans()`](Self::set_optimize_scans) → `false`
+    /// - [`set_use_scans_in_trellis()`](Self::set_use_scans_in_trellis) → `false`
+    ///
+    /// **Call this method before** any of the above, or their values will be silently lost.
     pub fn set_fastest_defaults(&mut self) {
         let smoothing_factor = self.cinfo.smoothing_factor;
         unsafe {
@@ -409,12 +523,18 @@ impl Compress {
         self.cinfo.smoothing_factor = smoothing_factor;
     }
 
-    /// Advanced. See `raw_data_in` in libjpeg docs.
+    /// Enable raw data mode for writing pre-downsampled YCbCr blocks
+    /// via [`write_raw_data()`](CompressStarted::write_raw_data) instead of scanlines.
+    ///
+    /// Reset to `false` by both
+    /// [`set_scan_optimization_mode()`](Self::set_scan_optimization_mode) and
+    /// [`set_fastest_defaults()`](Self::set_fastest_defaults). Call those methods first.
     pub fn set_raw_data_in(&mut self, opt: bool) {
         self.cinfo.raw_data_in = boolean::from(opt);
     }
 
-    /// Set image quality. Values 60-80 are recommended.
+    /// Set image quality on a 1–100 scale. Values 60–80 are recommended.
+    /// Higher values produce larger, higher-fidelity files.
     ///
     /// Quantization table values are not clamped to the 8-bit range, so at low
     /// quality settings (below ~50) some values may exceed 255 and produce
@@ -422,6 +542,11 @@ impl Compress {
     ///
     /// Use [`set_quality_force_8bit`](Self::set_quality_force_8bit) to control
     /// whether values are clamped to 1-255.
+    ///
+    /// Quantization tables are overwritten by
+    /// [`set_scan_optimization_mode()`](Self::set_scan_optimization_mode) and
+    /// [`set_fastest_defaults()`](Self::set_fastest_defaults) (reset to quality 75).
+    /// Call those methods first.
     pub fn set_quality(&mut self, quality: f32) {
         unsafe {
             ffi::jpeg_set_quality(&mut self.cinfo, quality as c_int, boolean::from(false));
@@ -439,6 +564,11 @@ impl Compress {
     /// encoding parameters.
     ///
     /// Corresponds to the `force_baseline` parameter in libjpeg's `jpeg_set_quality()`.
+    ///
+    /// Table contents are overwritten by
+    /// [`set_scan_optimization_mode()`](Self::set_scan_optimization_mode) and
+    /// [`set_fastest_defaults()`](Self::set_fastest_defaults) (reset to quality 75).
+    /// Call those methods first.
     pub fn set_quality_force_8bit(&mut self, quality: f32, force_8bit_quantization: bool) {
         unsafe {
             ffi::jpeg_set_quality(&mut self.cinfo, quality as c_int, boolean::from(force_8bit_quantization));
@@ -462,6 +592,11 @@ impl Compress {
     /// When `false`, values can go up to 32767.
     ///
     /// Corresponds to the `force_baseline` parameter in libjpeg's `jpeg_add_quant_table()`.
+    ///
+    /// Table contents are overwritten by
+    /// [`set_scan_optimization_mode()`](Self::set_scan_optimization_mode) and
+    /// [`set_fastest_defaults()`](Self::set_fastest_defaults) (reset to quality 75).
+    /// Call those methods first.
     pub fn set_luma_qtable_force_8bit(&mut self, qtable: &QTable, force_8bit_quantization: bool) {
         unsafe {
             ffi::jpeg_add_quant_table(&mut self.cinfo, 0, qtable.as_ptr(), 100, boolean::from(force_8bit_quantization) as c_int);
